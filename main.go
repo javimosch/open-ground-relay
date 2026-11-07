@@ -4,6 +4,9 @@
 //	host control link:  "OGR1 HOST <sim version>"         -> "CODE <code> <ttl s>"; then PING / PONG; the relay sends "PEER <token>"
 //	partner:            "OGR1 JOIN <code> <sim version>"  -> "WAIT" (the host is told) or "ERR <why>"
 //	host data link:     "OGR1 ACCEPT <token>"             -> "OK" to both, then byte for byte both ways
+//	host control link:  "DIRECT <port>"                   -> "DIRECT OK" / "DIRECT NO" (direct.go: the relay tries the host's port from outside)
+//	partner:            "OGR1 JOIN <code> <ver> D"        -> "DIRECT ip:port" first when the host is reachable and not public; the partner
+//	                                                         answers "RELAY" if it can't connect, then WAIT as above (old games: no D, no DIRECT)
 //	anyone:             "OGR1 PROBE"                       -> "PROBE <region> <battles>/<cap>" (the game measures relays and their room)
 //	host control link:  "INFO <public 0/1>|name|battle|shared 0/1|password 0/1|players/max" (any time: what the public list shows)
 //	anyone:             "OGR1 LIST <sim version>"         -> "BATTLE code|name|battle|shared|password" per public, not full battle; "END"
@@ -53,10 +56,11 @@ type session struct {
 	joins   int64
 	pending map[string]*pendingJoin // token -> the partner waiting for the host's ACCEPT
 	mu      sync.Mutex
-	public  bool   // (INFO) listed for anyone of the same version
-	info    string // name|battle|shared|password, as the host sent it (cleaned)
-	paired  int32  // partners piped right now
-	full    int    // (INFO players/max) 1: full, 0: room, -1: not said (then a battle with anyone paired is not listed)
+	public  bool         // (INFO) listed for anyone of the same version
+	info    string       // name|battle|shared|password, as the host sent it (cleaned)
+	paired  int32        // partners piped right now
+	direct  atomic.Value // (direct.go) "ip:port" the relay reached from outside, or ""
+	full    int          // (INFO players/max) 1: full, 0: room, -1: not said (then a battle with anyone paired is not listed)
 }
 
 type pendingJoin struct {
@@ -180,7 +184,7 @@ func (r *relay) handle(c net.Conn) {
 			c.Close()
 			return
 		}
-		r.joinLink(c, rd, strings.ToUpper(f[2]), f[3])
+		r.joinLink(c, rd, strings.ToUpper(f[2]), f[3], len(f) >= 5 && f[4] == "D")
 	case "ACCEPT":
 		if len(f) < 3 {
 			c.Close()
@@ -294,6 +298,8 @@ func (r *relay) hostLink(c net.Conn, rd *bufio.Reader, ver string) {
 			s.send("PONG")
 		} else if strings.HasPrefix(l, "INFO ") {
 			s.setInfo(strings.TrimSpace(l[5:]))
+		} else if strings.HasPrefix(l, "DIRECT ") {
+			go s.checkDirect(host(c), strings.TrimSpace(l[7:]))
 		}
 	}
 	c.Close()
@@ -312,7 +318,7 @@ func (r *relay) hostLink(c net.Conn, rd *bufio.Reader, ver string) {
 	log.Printf("close code=%s up=%s joins=%d", s.code, time.Since(s.started).Round(time.Second), atomic.LoadInt64(&s.joins))
 }
 
-func (r *relay) joinLink(c net.Conn, rd *bufio.Reader, code, ver string) {
+func (r *relay) joinLink(c net.Conn, rd *bufio.Reader, code, ver string, canDirect bool) {
 	a := host(c)
 	if !r.allowJoin(a) {
 		io.WriteString(c, "ERR too many tries, wait a minute\n")
@@ -334,6 +340,9 @@ func (r *relay) joinLink(c net.Conn, rd *bufio.Reader, code, ver string) {
 		c.Close()
 		log.Printf("join-version code=%s host=%s join=%s from=%s", code, s.ver, ver, a)
 		return
+	}
+	if canDirect && !s.offerDirect(c, rd) {
+		return // the partner went straight to the host (or left)
 	}
 	t := token()
 	p := &pendingJoin{conn: c, rd: rd, done: make(chan struct{})}
