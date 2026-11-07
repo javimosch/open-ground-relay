@@ -20,7 +20,8 @@ import (
 
 var (
 	registryURL   = flag.String("registry", "", "community relay registry (relays.json URL); empty: official relays only")
-	registryEvery = flag.Duration("registry-every", time.Hour, "how often the registry is fetched and its relays probed")
+	registryEvery = flag.Duration("registry-every", time.Hour, "how often the registry is fetched")
+	probeEvery    = flag.Duration("probe-every", 5*time.Minute, "how often the listed relays are probed (down after 2 misses, back at the first answer)")
 )
 
 // an id is the join code's prefix: letters and digits, no dash (the code is ID-WORD-NN)
@@ -41,7 +42,9 @@ type registry struct {
 
 var (
 	communityMu sync.Mutex
-	community   []string // "ID host:port", live at the last sweep
+	community   []string // "ID host:port", served now
+	listed      []regEntry
+	misses      = map[string]int{} // id -> probes missed in a row
 )
 
 // the ids of -relays (official): a community entry can never take one
@@ -96,7 +99,8 @@ func probe(e regEntry) bool {
 	c.SetDeadline(time.Now().Add(4 * time.Second))
 	io.WriteString(c, "OGR1 PROBE\n")
 	l, err := bufio.NewReader(io.LimitReader(c, 256)).ReadString('\n')
-	return err == nil && strings.TrimSpace(l) == "PROBE "+e.ID
+	f := strings.Fields(l) // "PROBE <id> [used/cap]"
+	return err == nil && len(f) >= 2 && f[0] == "PROBE" && f[1] == e.ID
 }
 
 func sweepRegistry() {
@@ -116,36 +120,65 @@ func sweepRegistry() {
 	for _, w := range why {
 		log.Printf("registry: skipped %s", w)
 	}
-	var live []string
-	var mu sync.Mutex
+	communityMu.Lock()
+	listed = es
+	communityMu.Unlock()
+	probeAll()
+}
+
+// probe every listed relay; one missing 2 probes in a row leaves the RELAYS answer until it answers again
+func probeAll() {
+	communityMu.Lock()
+	es := append([]regEntry(nil), listed...)
+	communityMu.Unlock()
+	ok := make([]bool, len(es))
 	var wg sync.WaitGroup
-	for _, e := range es {
+	for i, e := range es {
 		wg.Add(1)
-		go func(e regEntry) {
-			defer wg.Done()
-			if probe(e) {
-				mu.Lock()
-				live = append(live, e.ID+" "+net.JoinHostPort(e.Host, fmt.Sprint(e.Port)))
-				mu.Unlock()
-			} else {
-				log.Printf("registry: %s (%s:%d) does not answer PROBE %s: not served", e.ID, e.Host, e.Port, e.ID)
-			}
-		}(e)
+		go func(i int, e regEntry) { defer wg.Done(); ok[i] = probe(e) }(i, e)
 	}
 	wg.Wait()
+	var live []string
 	communityMu.Lock()
+	for i, e := range es {
+		was, known := misses[e.ID]
+		if !known {
+			was = 2 // (a new entry is served once it has answered)
+			misses[e.ID] = 2
+		}
+		if ok[i] {
+			misses[e.ID] = 0
+			if known && was >= 2 {
+				log.Printf("registry: %s answers again", e.ID)
+			}
+		} else {
+			misses[e.ID]++
+			if known && misses[e.ID] == 2 {
+				log.Printf("registry: %s (%s:%d) missed 2 probes: down, not served", e.ID, e.Host, e.Port)
+			}
+		}
+		if misses[e.ID] < 2 {
+			live = append(live, e.ID+" "+net.JoinHostPort(e.Host, fmt.Sprint(e.Port)))
+		}
+	}
 	community = live
 	communityMu.Unlock()
-	log.Printf("registry: %d community relays live of %d listed", len(live), len(es))
+	log.Printf("registry: %d community relays served of %d listed", len(live), len(es))
 }
 
 func watchRegistry() {
 	if *registryURL == "" {
 		return
 	}
+	sweepRegistry()
+	fetch, pr := time.NewTicker(*registryEvery), time.NewTicker(*probeEvery)
 	for {
-		sweepRegistry()
-		time.Sleep(*registryEvery)
+		select {
+		case <-fetch.C:
+			sweepRegistry()
+		case <-pr.C:
+			probeAll()
+		}
 	}
 }
 

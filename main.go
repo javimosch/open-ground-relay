@@ -4,7 +4,7 @@
 //	host control link:  "OGR1 HOST <sim version>"         -> "CODE <code> <ttl s>"; then PING / PONG; the relay sends "PEER <token>"
 //	partner:            "OGR1 JOIN <code> <sim version>"  -> "WAIT" (the host is told) or "ERR <why>"
 //	host data link:     "OGR1 ACCEPT <token>"             -> "OK" to both, then byte for byte both ways
-//	anyone:             "OGR1 PROBE"                       -> "PROBE <region>" (the game measures relays with it)
+//	anyone:             "OGR1 PROBE"                       -> "PROBE <region> <battles>/<cap>" (the game measures relays and their room)
 //	host control link:  "INFO <public 0/1>|name|battle|shared 0/1|password 0/1|players/max" (any time: what the public list shows)
 //	anyone:             "OGR1 LIST <sim version>"         -> "BATTLE code|name|battle|shared|password" per public, not full battle; "END"
 //	anyone:             "OGR1 RELAYS"                      -> "RELAY <region> <host:port> [COMMUNITY]" per relay in -relays, then the live
@@ -32,7 +32,7 @@ import (
 var (
 	addr        = flag.String("addr", ":47160", "listen address")
 	region      = flag.String("region", "EU", "this relay's region id (the code's prefix)")
-	maxSessions = flag.Int("max-sessions", 200, "open battles at most")
+	maxSessions = flag.Int("max-sessions", 0, "open battles at most; 0: worked out from the machine and -max-mbps (capacity.go)")
 	maxBytes    = flag.Int64("max-bytes", 500<<20, "bytes at most per piped link (both ways)")
 	joinPerMin  = flag.Int("join-per-min", 10, "join attempts a minute per address")
 	relays      = flag.String("relays", "", "every relay the games may use, REGION=host:port,... (served by RELAYS; this one included)")
@@ -74,6 +74,7 @@ type relay struct {
 }
 
 func newRelay() *relay {
+	setCap()
 	return &relay{sessions: map[string]*session{}, tokens: map[string]*session{}, joins: map[string][]time.Time{}}
 }
 
@@ -148,7 +149,14 @@ func (r *relay) handle(c net.Conn) {
 	c.SetReadDeadline(time.Time{})
 	switch f[1] {
 	case "PROBE":
-		io.WriteString(c, "PROBE "+*region+"\n")
+		r.mu.Lock()
+		n := len(r.sessions)
+		r.mu.Unlock()
+		used := n
+		if full(n) && used < sessionCap {
+			used = sessionCap // (the bandwidth is used up: say full)
+		}
+		fmt.Fprintf(c, "PROBE %s %d/%d\n", *region, used, sessionCap)
 		c.Close()
 	case "STATUS":
 		r.status(c)
@@ -263,7 +271,7 @@ func (r *relay) list(c net.Conn, ver string) {
 
 func (r *relay) hostLink(c net.Conn, rd *bufio.Reader, ver string) {
 	r.mu.Lock()
-	if len(r.sessions) >= *maxSessions {
+	if full(len(r.sessions)) {
 		r.mu.Unlock()
 		io.WriteString(c, "ERR the relay is full, try again later\n")
 		c.Close()
@@ -394,6 +402,7 @@ func (r *relay) acceptLink(c net.Conn, rd *bufio.Reader, t string) {
 	n := pipe(c, rd, p.conn, p.rd)
 	atomic.AddInt32(&s.paired, -1)
 	atomic.AddInt64(&r.piped, n)
+	atomic.AddInt64(&pipedTotal, n)
 	log.Printf("unpaired code=%s bytes=%d up=%s", s.code, n, time.Since(start).Round(time.Second))
 	close(p.done)
 }
@@ -453,7 +462,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("og-relay region=%s on %s (max %d battles)", *region, *addr, *maxSessions)
+	go watchRate()
+	log.Printf("og-relay region=%s on %s", *region, *addr)
 	go watchRegistry()
 	newRelay().serve(ln)
 }

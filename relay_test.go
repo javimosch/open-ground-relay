@@ -108,7 +108,7 @@ func TestErrors(t *testing.T) {
 	}
 	pc, pr := dial(t, a, "OGR1 PROBE")
 	defer pc.Close()
-	if l := readLine(t, pr); l != "PROBE EU" {
+	if l := readLine(t, pr); !strings.HasPrefix(l, "PROBE EU ") || !strings.Contains(l, "/") {
 		t.Fatalf("got %q", l)
 	}
 	// the host leaves: its code dies

@@ -69,3 +69,70 @@ func TestRegistry(t *testing.T) {
 	}
 	_ = strings.TrimSpace
 }
+
+// (R7) a served relay that stops: still served after 1 missed probe, gone after 2, back at its first answer
+func TestDownAfterTwoMisses(t *testing.T) {
+	old := *relays
+	*relays = "EU=188.245.71.48:47160"
+	defer func() { *relays = old; listed = nil; community = nil; misses = map[string]int{} }()
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	port := ln.Addr().(*net.TCPAddr).Port
+	serve := func(l net.Listener) {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			bufio.NewReader(c).ReadString('\n')
+			fmt.Fprintf(c, "PROBE UP1 3/50\n")
+			c.Close()
+		}
+	}
+	go serve(ln)
+	listed = []regEntry{{ID: "UP1", Host: "127.0.0.1", Port: port}}
+	served := func() int { communityMu.Lock(); defer communityMu.Unlock(); return len(community) }
+	probeAll()
+	if served() != 1 {
+		t.Fatal("a live relay not served")
+	}
+	ln.Close()
+	probeAll()
+	if served() != 1 {
+		t.Fatal("dropped after one miss")
+	}
+	probeAll()
+	if served() != 0 {
+		t.Fatal("still served after two misses")
+	}
+	ln2, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Skip("port taken again")
+	}
+	defer ln2.Close()
+	go serve(ln2)
+	probeAll()
+	if served() != 1 {
+		t.Fatal("not back after answering")
+	}
+}
+
+// (R7) the cap: -max-sessions wins; else the machine's limits, -max-mbps among them
+func TestCap(t *testing.T) {
+	oldS, oldM := *maxSessions, *maxMbps
+	defer func() { *maxSessions, *maxMbps = oldS, oldM; setCap() }()
+	*maxSessions = 3
+	setCap()
+	if sessionCap != 3 || full(2) || !full(3) {
+		t.Fatalf("cap %d", sessionCap)
+	}
+	*maxSessions, *maxMbps = 0, 2
+	setCap()
+	if sessionCap != 20 {
+		t.Fatalf("2 Mbit/s should give 20, got %d", sessionCap)
+	}
+	*maxMbps = 0.1
+	setCap()
+	if sessionCap != minCap {
+		t.Fatalf("floor %d, got %d", minCap, sessionCap)
+	}
+}
